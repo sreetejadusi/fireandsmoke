@@ -1,0 +1,4 @@
+opencv-python
+simpleaudio
+onnxruntime
+numpy

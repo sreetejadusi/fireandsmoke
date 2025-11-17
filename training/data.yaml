@@ -1,0 +1,5 @@
+train: C:/Users/Sree Teja Dusi/Documents/Research/fireandsmoke/data/indoor_fire_smoke/train/images
+val: C:/Users/Sree Teja Dusi/Documents/Research/fireandsmoke/data/indoor_fire_smoke/valid/images
+
+nc: 2
+names: ['fire', 'smoke']
