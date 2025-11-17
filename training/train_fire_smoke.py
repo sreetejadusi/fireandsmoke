@@ -2,9 +2,6 @@ import os
 import subprocess
 from datetime import datetime
 
-# ==================================================
-# 🔥 YOLOv5 Fire & Smoke Training Script (with Logging)
-# ==================================================
 
 PROJECT_ROOT = os.getcwd()
 YOLO_DIR = os.path.join(PROJECT_ROOT, "yolov5")
@@ -14,7 +11,7 @@ RUN_NAME = f"fire_yolov5n_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
 os.makedirs(LOGS_DIR, exist_ok=True)
 
-# Log file
+
 LOG_FILE = os.path.join(LOGS_DIR, f"{RUN_NAME}.log")
 
 EPOCHS = 15
@@ -23,13 +20,10 @@ IMAGE_SIZE = 416
 DEVICE = "cpu"
 CACHE = True
 
-print(f"\n🚀 Starting training: {RUN_NAME}")
+print(f"\nStarting training: {RUN_NAME}")
 print(f"Logs will be saved in: {LOG_FILE}\n")
 
 
-# -----------------------------
-# Helper function to run commands with logging
-# -----------------------------
 def run_with_log(cmd):
     with open(LOG_FILE, "a", buffering=1) as f:
         process = subprocess.Popen(
@@ -39,7 +33,6 @@ def run_with_log(cmd):
             universal_newlines=True,
         )
 
-        # Stream to both console and log file
         for line in process.stdout:
             print(line, end="")
             f.write(line)
@@ -50,9 +43,6 @@ def run_with_log(cmd):
             raise subprocess.CalledProcessError(process.returncode, cmd)
 
 
-# -----------------------------
-# Training Command
-# -----------------------------
 train_cmd = [
     "python",
     os.path.join(YOLO_DIR, "train.py"),
@@ -73,13 +63,11 @@ train_cmd = [
     "--cache",
 ]
 
-print("🔧 Running training command...\n")
+print("Running training command...\n")
 run_with_log(train_cmd)
 
-# -----------------------------
-# Export Command
-# -----------------------------
-print("\n📦 Exporting model to ONNX and TFLite formats...\n")
+
+print("\nExporting model to ONNX and TFLite formats...\n")
 
 weights_path = os.path.join(YOLO_DIR, "runs", "train", RUN_NAME, "weights", "best.pt")
 export_cmd = [
@@ -94,10 +82,8 @@ export_cmd = [
 
 run_with_log(export_cmd)
 
-# -----------------------------
-# Completion Message
-# -----------------------------
-print("\n✅ Training & export complete!")
+
+print("\nTraining & export complete!")
 print(f"Best weights: {weights_path}")
 print(f"Exported model: {os.path.dirname(weights_path)}")
-print(f"📄 Full log saved at: {LOG_FILE}")
+print(f"Full log saved at: {LOG_FILE}")
