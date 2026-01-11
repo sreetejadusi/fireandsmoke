@@ -11,7 +11,7 @@ import argparse
 
 
 MODEL_PATH = "model/best.onnx"
-CAMERA_URL = "http://192.168.1.11:8080/video"
+CAMERA_URL = "http://192.168.1.7:8080/video"
 IMG_SIZE = 416
 FRAME_SKIP = 60
 CONF_THRESHOLD = 0.30
