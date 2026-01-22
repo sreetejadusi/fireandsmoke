@@ -5,236 +5,265 @@ import simpleaudio as sa
 import time
 import csv
 import os
-from collections import deque, defaultdict
+from collections import deque
 from datetime import datetime
 
-# ===================== CONFIG =====================
 MODEL_PATH = "model/best.onnx"
 VIDEO_PATH = "video/testing.mp4"
-LOG_CSV = "logs/detection_log_video.csv"
-ALARM_WAV = "alarm.wav"
+LOG_DIR = "plots"
+LOG_FILE = f"{LOG_DIR}/advanced_fire_analysis.csv"
 
-IMG_SIZE = 416
-FRAME_SKIP = 60
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
 
-CONF_THRESHOLD = 0.30
-FINAL_SCORE_THRESH = 0.60
-IOU_MATCH_THRESH = 0.4
-REQUIRED_STREAK = 3
-COOLDOWN = 10
-MAX_HISTORY = 8
-
-W_YOLO = 0.6
-W_FLICKER = 0.2
+FRAME_SKIP = 3
+HISTORY_SIZE = 20
+FLICKER_SENSITIVITY = 50
+GROWTH_THRESHOLD = 0.1
+W_YOLO = 0.4
+W_FLICKER = 0.4
 W_GROWTH = 0.2
-# ==================================================
+FINAL_THRESH = 0.65
 
-os.makedirs(os.path.dirname(LOG_CSV), exist_ok=True)
+class FireAnalyzer:
+    def __init__(self, obj_id, bbox, conf):
+        self.obj_id = obj_id
+        self.bbox = bbox
+        self.yolo_conf = conf
 
-CSV_HEADER = [
-    "timestamp",
-    "frame_idx",
-    "obj_id",
-    "x1",
-    "y1",
-    "x2",
-    "y2",
-    "yolo_conf",
-    "flicker",
-    "growth",
-    "final_score",
-    "action",
-]
+        self.brightness_stream = deque(maxlen=HISTORY_SIZE)
+        self.area_stream = deque(maxlen=HISTORY_SIZE)
 
-write_header = not os.path.exists(LOG_CSV) or os.path.getsize(LOG_CSV) == 0
-if write_header:
-    with open(LOG_CSV, "w", newline="") as f:
-        csv.writer(f).writerow(CSV_HEADER)
+        self.flicker_score = 0.0
+        self.growth_score = 0.0
+        self.fusion_score = 0.0
+        self.is_growing = False
+
+    def update_analysis(self, frame, bbox, conf):
+        """
+        Performs the advanced temporal analysis on the specific object.
+        """
+        self.bbox = bbox
+        self.yolo_conf = conf
+
+        x1, y1, x2, y2 = map(int, bbox)
+        h, w, _ = frame.shape
+
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+
+        current_brightness = 0.0
+        if x2 > x1 and y2 > y1:
+            roi = frame[y1:y2, x1:x2]
+            gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            current_brightness = np.mean(gray_roi) / 255.0
+
+        self.brightness_stream.append(current_brightness)
+
+        if len(self.brightness_stream) > 5:
+            variance = np.var(self.brightness_stream)
+            self.flicker_score = np.clip(variance * FLICKER_SENSITIVITY, 0, 1)
+        else:
+            self.flicker_score = 0.0
+
+        current_area = (x2 - x1) * (y2 - y1)
+        self.area_stream.append(current_area)
+
+        if len(self.area_stream) > 5:
+            past_areas = list(self.area_stream)[:-3]
+            avg_past_area = np.mean(past_areas)
+
+            if avg_past_area > 0:
+                growth_rate = (current_area - avg_past_area) / avg_past_area
+                self.growth_score = np.clip(growth_rate * 5, 0, 1)
+                self.is_growing = growth_rate > GROWTH_THRESHOLD
+            else:
+                self.growth_score = 0.0
+
+        self.fusion_score = (
+            (W_YOLO * self.yolo_conf)
+            + (W_FLICKER * self.flicker_score)
+            + (W_GROWTH * self.growth_score)
+        )
 
 
-# ===================== UTILITIES =====================
-def iou_xyxy(a, b):
-    x1 = max(a[0], b[0])
-    y1 = max(a[1], b[1])
-    x2 = min(a[2], b[2])
-    y2 = min(a[3], b[3])
+def calculate_iou(box1, box2):
+    """Intersection Over Union for tracking"""
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
     inter = max(0, x2 - x1) * max(0, y2 - y1)
-    area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
-    area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
-    return inter / (area_a + area_b - inter + 1e-9)
+    union = (
+        ((box1[2] - box1[0]) * (box1[3] - box1[1]))
+        + ((box2[2] - box2[0]) * (box2[3] - box2[1]))
+        - inter
+    )
+    return inter / union if union > 0 else 0
 
 
-def compute_brightness(roi):
-    if roi is None or roi.size == 0:
-        return 0.0
-    if roi.shape[0] < 2 or roi.shape[1] < 2:
-        return 0.0
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    return float(np.mean(gray))
-
-
-def flicker_score(hist):
-    if len(hist) < 3:
-        return 0.0
-    return float(np.clip(np.tanh(np.var(hist) / 100.0), 0.0, 1.0))
-
-
-def growth_score(hist):
-    if len(hist) < 3 or hist[0] <= 0:
-        return 0.0
-    return float(np.clip(np.tanh((hist[-1] - hist[0]) / (hist[0] * 2)), 0.0, 1.0))
-
-
-# ===================== LOAD MODEL =====================
-print("Loading ONNX model...")
 session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
 input_name = session.get_inputs()[0].name
-print("ONNX loaded.")
+output_name = session.get_outputs()[0].name
 
-# ===================== ALARM =====================
+
 try:
-    wave_obj = sa.WaveObject.from_wave_file(ALARM_WAV)
+    wave_obj = sa.WaveObject.from_wave_file("alarm.wav")
     alarm_enabled = True
 except:
     alarm_enabled = False
 
-
-def play_alarm():
-    if alarm_enabled:
-        wave_obj.play()
-
-
-# ===================== STATE =====================
-tracks = {}
-brightness_hist = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
-area_hist = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
-streaks = defaultdict(int)
-next_id = 0
-last_alarm_time = 0
-
-# ===================== VIDEO =====================
 cap = cv2.VideoCapture(VIDEO_PATH)
-if not cap.isOpened():
-    print("❌ Could not open video.")
-    exit(1)
+frame_count = 0
 
-print("🎬 Video opened. Starting advanced fire detection...\n")
+active_fires = {}
+next_id = 0
 
-frame_idx = 0
+
+with open(LOG_FILE, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(
+        [
+            "Timestamp",
+            "Frame",
+            "ID",
+            "YOLO_Conf",
+            "Flicker_Score",
+            "Growth_Score",
+            "FINAL_SCORE",
+            "Alarm",
+        ]
+    )
+
+print("🔥 Advanced Analysis System Running...")
 
 while True:
     ret, frame = cap.read()
     if not ret:
-        print("\n✅ Video processing completed.")
         break
 
-    frame_idx += 1
-    if frame_idx % FRAME_SKIP != 0:
+    frame_count += 1
+
+    if frame_count % FRAME_SKIP != 0:
         continue
 
-    h, w = frame.shape[:2]
-    timestamp = datetime.now().isoformat()
+    img_size = 416
+    img = cv2.resize(frame, (img_size, img_size))
+    img = img[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
+    img = np.expand_dims(img, axis=0)
 
-    img = cv2.resize(frame, (IMG_SIZE, IMG_SIZE))
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    img = np.transpose(img, (2, 0, 1))[None, ...]
-
-    preds = session.run(None, {input_name: img})[0][0]
+    outputs = session.run([output_name], {input_name: img})[0]
 
     detections = []
-    for det in preds:
-        conf = float(det[4])
-        if conf < CONF_THRESHOLD:
-            continue
+    h, w = frame.shape[:2]
 
-        x1 = int((det[0] - det[2] / 2) * w)
-        y1 = int((det[1] - det[3] / 2) * h)
-        x2 = int((det[0] + det[2] / 2) * w)
-        y2 = int((det[1] + det[3] / 2) * h)
+    for det in outputs[0]:
+        confidence = det[4]
+        if confidence > 0.4:
+            cx, cy, bw, bh = det[0], det[1], det[2], det[3]
+            x1 = (cx - bw / 2) * (w / img_size)
+            y1 = (cy - bh / 2) * (h / img_size)
+            x2 = (cx + bw / 2) * (w / img_size)
+            y2 = (cy + bh / 2) * (h / img_size)
+            detections.append(([x1, y1, x2, y2], confidence))
 
-        detections.append((x1, y1, x2, y2, conf))
+    new_active_fires = {}
 
-    assigned = {}
-    used = set()
+    for bbox, conf in detections:
+        matched_id = None
+        max_iou = 0
 
-    for i, d in enumerate(detections):
-        best_iou, best_id = 0, None
-        for tid, tb in tracks.items():
-            if tid in used:
-                continue
-            iou = iou_xyxy(d[:4], tb)
-            if iou > best_iou:
-                best_iou, best_id = iou, tid
-        if best_iou >= IOU_MATCH_THRESH:
-            assigned[i] = best_id
-            used.add(best_id)
+        for obj_id, analyzer in active_fires.items():
+            iou = calculate_iou(bbox, analyzer.bbox)
+            if iou > max_iou:
+                max_iou = iou
+                matched_id = obj_id
 
-    for i in range(len(detections)):
-        if i not in assigned:
+        if max_iou > 0.3:
+
+            analyzer = active_fires[matched_id]
+            analyzer.update_analysis(frame, bbox, conf)
+            new_active_fires[matched_id] = analyzer
+            del active_fires[matched_id]
+        else:
+
+            new_analyzer = FireAnalyzer(next_id, bbox, conf)
+            new_analyzer.update_analysis(frame, bbox, conf)
+            new_active_fires[next_id] = new_analyzer
             next_id += 1
-            assigned[i] = next_id
-            tracks[next_id] = detections[i][:4]
 
-    frame_status = "No fire detected"
+    active_fires = new_active_fires
 
-    for i, tid in assigned.items():
-        x1, y1, x2, y2, conf = detections[i]
-        x1 = max(0, min(x1, w - 1))
-        y1 = max(0, min(y1, h - 1))
-        x2 = max(0, min(x2, w - 1))
-        y2 = max(0, min(y2, h - 1))
+    current_time = datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
-        if x2 <= x1 or y2 <= y1:
-            continue
+    if active_fires:
 
-        roi = frame[y1:y2, x1:x2]
-        brightness = compute_brightness(roi)
-        area = (x2 - x1) * (y2 - y1)
+        for obj_id, fire in active_fires.items():
+            x1, y1, x2, y2 = map(int, fire.bbox)
 
-        brightness_hist[tid].append(brightness)
-        area_hist[tid].append(area)
+            if fire.fusion_score > FINAL_THRESH:
+                color = (0, 0, 255)
+                label = f"FIRE DETECTED [{fire.fusion_score:.2f}]"
+                if alarm_enabled:
+                    wave_obj.play()
+                is_alarm = "YES"
+            else:
+                color = (0, 255, 0)
+                label = f"Analyzing... [{fire.fusion_score:.2f}]"
+                is_alarm = "NO"
 
-        flicker = flicker_score(brightness_hist[tid])
-        growth = growth_score(area_hist[tid])
-        final_score = W_YOLO * conf + W_FLICKER * flicker + W_GROWTH * growth
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(
+                frame, label, (x1, y1 - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2
+            )
+            info_text = (
+                f"Flicker:{fire.flicker_score:.2f} | Growth:{fire.growth_score:.2f}"
+            )
+            cv2.putText(
+                frame,
+                info_text,
+                (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                1,
+            )
 
-        action = ""
-        streaks[tid] = streaks[tid] + 1 if final_score >= FINAL_SCORE_THRESH else 0
+            with open(LOG_FILE, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        current_time,
+                        frame_count,
+                        obj_id,
+                        f"{fire.yolo_conf:.2f}",
+                        f"{fire.flicker_score:.2f}",
+                        f"{fire.growth_score:.2f}",
+                        f"{fire.fusion_score:.2f}",
+                        is_alarm,
+                    ]
+                )
+    else:
 
-        if streaks[tid] >= REQUIRED_STREAK and time.time() - last_alarm_time > COOLDOWN:
-            play_alarm()
-            last_alarm_time = time.time()
-            action = "ALARM"
-            streaks[tid] = 0
-
-        frame_status = f"Fire {conf*100:.1f}% | Final {final_score:.2f}"
-
-        with open(LOG_CSV, "a", newline="") as f:
-            csv.writer(f).writerow(
+        with open(LOG_FILE, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
                 [
-                    timestamp,
-                    frame_idx,
-                    tid,
-                    x1,
-                    y1,
-                    x2,
-                    y2,
-                    f"{conf:.4f}",
-                    f"{flicker:.4f}",
-                    f"{growth:.4f}",
-                    f"{final_score:.4f}",
-                    action,
+                    current_time,
+                    frame_count,
+                    "None",
+                    "0.00",
+                    "0.00",
+                    "0.00",
+                    "0.00",
+                    "NO",
                 ]
             )
 
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-
-    print(f"Frame {frame_idx} → {frame_status}")
-    cv2.imshow("Advanced Fire Detection (Video)", cv2.resize(frame, (960, 640)))
-
-    if cv2.waitKey(1) & 0xFF == ord("q"):
+    cv2.imshow("Advanced Fire Analysis", frame)
+    if cv2.waitKey(1) == ord("q"):
         break
 
 cap.release()
 cv2.destroyAllWindows()
-print("\n📊 Logs saved to:", LOG_CSV)
+print(f"\n✅ Processing Complete. Logs saved to: {LOG_FILE}")

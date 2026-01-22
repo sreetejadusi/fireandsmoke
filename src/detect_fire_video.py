@@ -3,8 +3,6 @@ import numpy as np
 import onnxruntime as ort
 import simpleaudio as sa
 import time
-import csv
-import os
 from datetime import datetime
 from collections import deque
 
@@ -14,11 +12,6 @@ IMG_SIZE = 416
 CONF_THRESHOLD = 0.60
 REQUIRED_STREAK = 10
 FRAME_SKIP = 20
-COOLDOWN = 10
-
-LOG_CSV = "logs/detection_log_yolo_only.csv"
-os.makedirs("logs", exist_ok=True)
-
 detections_queue = deque(maxlen=REQUIRED_STREAK)
 
 session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
@@ -31,61 +24,72 @@ except:
     alarm_enabled = False
 
 cap = cv2.VideoCapture(VIDEO_PATH)
+
 if not cap.isOpened():
     print("Could not open video.")
     exit()
 
-if not os.path.exists(LOG_CSV):
-    with open(LOG_CSV, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["timestamp", "frame_idx", "max_confidence", "alarm_triggered"])
+print("Running detection on video...\n")
 
-frame_idx = 0
+frame_counter = 0
 last_alarm_time = 0
-
-print("Running YOLO-only detection on video...\n")
+cooldown = 10
 
 while True:
     ret, frame = cap.read()
     if not ret:
+        print("\nFinished processing video.")
         break
 
-    frame_idx += 1
+    frame_counter += 1
 
-    if frame_idx % FRAME_SKIP != 0:
+    if frame_counter % FRAME_SKIP != 0:
         continue
 
-    timestamp = datetime.utcnow().isoformat()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     img = cv2.resize(frame, (IMG_SIZE, IMG_SIZE))
-    img = img[:, :, ::-1].astype(np.float32) / 255.0
-    img = np.transpose(img, (2, 0, 1))[None]
+    img = img[:, :, ::-1]
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))
+    img = np.expand_dims(img, axis=0)
 
-    outputs = session.run(None, {input_name: img})[0][0]
+    outputs = session.run(None, {input_name: img})[0]
+    predictions = outputs[0]
 
-    fire_conf = [det[4] for det in outputs if det[4] >= 0.01]
+    fire_confidences = []
+    for det in predictions:
+        conf = det[4]
+        cls = int(det[5])
+        if cls in [0, 1] and conf >= 0.01:
+            fire_confidences.append(conf)
 
-    max_conf = max(fire_conf) if fire_conf else 0.0
-    detections_queue.append(max_conf)
+    if fire_confidences:
+        max_conf = max(fire_confidences)
+        detections_queue.append(max_conf)
+        print(f"{timestamp} | Fire Probability: {max_conf * 100:.1f}%")
+    else:
+        detections_queue.append(0.0)
+        print(f"{timestamp} | No Fire Detected")
 
-    alarm = 0
     now = time.time()
 
     if (
         len(detections_queue) == REQUIRED_STREAK
         and all(c >= CONF_THRESHOLD for c in detections_queue)
-        and now - last_alarm_time > COOLDOWN
+        and now - last_alarm_time > cooldown
     ):
-        alarm = 1
-        last_alarm_time = now
-        detections_queue.clear()
+        print(f"\n{timestamp} | FIRE DETECTED — ALARM TRIGGERED\n")
         if alarm_enabled:
             wave_obj.play()
+        last_alarm_time = now
+        detections_queue.clear()
 
-    with open(LOG_CSV, "a", newline="") as f:
-        csv.writer(f).writerow([timestamp, frame_idx, f"{max_conf:.4f}", alarm])
+    cv2.imshow("🔥 Fire Detection", frame)
 
-    print(f"Frame {frame_idx} | YOLO conf: {max_conf:.2f} | Alarm: {alarm}")
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
 
 cap.release()
-print("YOLO-only detection finished.")
+cv2.destroyAllWindows()
+print("\nDetection stopped.")
