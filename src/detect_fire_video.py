@@ -5,6 +5,8 @@ import simpleaudio as sa
 import time
 from datetime import datetime
 from collections import deque
+import os
+import requests
 
 MODEL_PATH = "model/best.onnx"
 VIDEO_PATH = "video/testing.mp4"
@@ -17,13 +19,24 @@ detections_queue = deque(maxlen=REQUIRED_STREAK)
 session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
 input_name = session.get_inputs()[0].name
 
-try:
-    wave_obj = sa.WaveObject.from_wave_file("alarm.wav")
-    alarm_enabled = True
-except:
-    alarm_enabled = False
+
+wave_obj = sa.WaveObject.from_wave_file("alarm.wav")
+alarm_enabled = True
 
 cap = cv2.VideoCapture(VIDEO_PATH)
+
+BOT_TOKEN = "8549502774:AAFrzMn5tWhLnk1UurnEiytEkvFWn3MZnoQ"
+CHAT_ID = "1062443919"
+
+
+def send_telegram_alert(message):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message}
+    try:
+        requests.post(url, data=payload, timeout=5)
+    except:
+        pass
+
 
 if not cap.isOpened():
     print("Could not open video.")
@@ -82,6 +95,12 @@ while True:
         print(f"\n{timestamp} | FIRE DETECTED — ALARM TRIGGERED\n")
         if alarm_enabled:
             wave_obj.play()
+        send_telegram_alert(
+            f"🔥 FIRE DETECTED!\n"
+            f"Time: {timestamp}\n"
+            f"Confidence Score: {max_conf:.2f}\n"
+            f"Device: Edge Camera"
+        )
         last_alarm_time = now
         detections_queue.clear()
 

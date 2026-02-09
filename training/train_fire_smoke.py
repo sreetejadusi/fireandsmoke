@@ -77,7 +77,6 @@ export_cmd = [
     weights_path,
     "--include",
     "onnx",
-    "tflite",
 ]
 
 run_with_log(export_cmd)
